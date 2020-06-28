@@ -25,6 +25,7 @@
 #include <espressif/esp_sta.h>
 #include <espressif/esp_common.h>
 #include <esp/uart.h>
+#include <sysparam.h>
 #include <esp8266.h>
 #include <FreeRTOS.h>
 #include <task.h>
@@ -38,16 +39,19 @@
 
 #include "config.h"
 
-// The GPIO pin that is connected to the relay on the Sonoff S26
+// The GPIO pin that is connected to the relay on the Sonoff Basic
 const int relay_gpio = RELAY_GPIO;
-// The GPIO pin that is connected to the LED on the Sonoff S26
+// The GPIO pin that is connected to the LED on the Sonoff Basic
 const int led_gpio = LED_GPIO;
-// The GPIO pin that is oconnected to the button on the Sonoff S26
+// The GPIO pin that is connected to the button on the Sonoff Basic
 const int button_gpio = BUTTON_GPIO;
+// The name of the relay state sysparam.
+const char* relay_state = "sonoff_relay_state";
+
 
 
 // one short blink every 3 seconds
-led_status_pattern_t mode_normal = LED_STATUS_PATTERN({100, -2900});
+led_status_pattern_t mode_normal = LED_STATUS_PATTERN({100, -2900}); // LED_STATUS_PATTERN({-1500, -1500});
 // two short blinks every 3 seconds
 led_status_pattern_t mode_connecting_to_wifi = LED_STATUS_PATTERN({100, -100, 100, -2700});
 // long blink, long wait
@@ -102,10 +106,17 @@ homekit_characteristic_t switch_on = HOMEKIT_CHARACTERISTIC_(
 
 void relay_init() {
     gpio_enable(relay_gpio, GPIO_OUTPUT);
+    // Restore the last value of the relay (before power loss).
+    bool last_state;
+    if (sysparam_get_bool(relay_state, &last_state) == SYSPARAM_OK) {
+        switch_on.value.bool_value = last_state;
+    }
+
     relay_write(switch_on.value.bool_value);
 }
 
 void switch_on_callback(homekit_accessory_t *acc, homekit_characteristic_t *_ch, homekit_value_t on, void *context) {
+    sysparam_set_bool(relay_state, switch_on.value.bool_value);
     relay_write(switch_on.value.bool_value);
 }
 
@@ -132,28 +143,58 @@ void button_callback(button_event_t event, void *_context) {
     }
 }
 
+void user_sysparam_init() {
+    sysparam_status_t status;
+    uint32_t base_addr, num_sectors; 
+
+    status = sysparam_get_info(&base_addr, &num_sectors);
+
+    if (status == SYSPARAM_OK) {
+        printf("[current sysparam region is at 0x%08x (%d sectors)]\n", base_addr, num_sectors);
+    } else {
+        printf("[NOTE: No current sysparam region (initialization problem during boot?)]\n");
+        // Default to the same place/size as the normal system initialization
+        // stuff, so if the user uses this utility to reformat it, it will put
+        // it somewhere the system will find it later
+        num_sectors = DEFAULT_SYSPARAM_SECTORS;
+        base_addr = sdk_flashchip.chip_size - (5 + num_sectors) * sdk_flashchip.sector_size;
+        printf("[proposed sysparam region is at 0x%08x (%d sectors)]\n", base_addr, num_sectors);
+
+        status = sysparam_create_area(base_addr, num_sectors, true);
+        if (status != SYSPARAM_OK) {
+            printf("[sysparam_create_area failed: %d]\n", status);
+        } else {
+            // We need to re-init after wiping out the region we've been
+            // using.
+            status = sysparam_init(base_addr, 0);
+            if (status != SYSPARAM_OK) {
+                printf("[sysparam_init failed: %d]\n", status);
+            }
+        }
+    }
+}
+
 void switch_identify(homekit_value_t _value) {
     printf("Switch identify\n");
     led_status_signal(status, &mode_identify);
 }
 
-homekit_characteristic_t name = HOMEKIT_CHARACTERISTIC_(NAME, "Sonoff Outlet");
+homekit_characteristic_t name = HOMEKIT_CHARACTERISTIC_(NAME, "Sonoff Switch");
 
 homekit_accessory_t *accessories[] = {
-    HOMEKIT_ACCESSORY(.id=1, .category=homekit_accessory_category_outlet, .services=(homekit_service_t*[]){
+    HOMEKIT_ACCESSORY(.id=1, .category=homekit_accessory_category_switch, .services=(homekit_service_t*[]){
         HOMEKIT_SERVICE(ACCESSORY_INFORMATION, .characteristics=(homekit_characteristic_t*[]){
             &name,
             HOMEKIT_CHARACTERISTIC(MANUFACTURER, "iTEAD"),
-            HOMEKIT_CHARACTERISTIC(SERIAL_NUMBER, "037A2BABF19E"),
-            HOMEKIT_CHARACTERISTIC(MODEL, "S26"),
+            HOMEKIT_CHARACTERISTIC(SERIAL_NUMBER, "037A2BABF19D"),
+            HOMEKIT_CHARACTERISTIC(MODEL, "Basic R3"),
             HOMEKIT_CHARACTERISTIC(FIRMWARE_REVISION, "0.1.6"),
             HOMEKIT_CHARACTERISTIC(IDENTIFY, switch_identify),
             NULL
         }),
-        HOMEKIT_SERVICE(OUTLET, .primary=true, .characteristics=(homekit_characteristic_t*[]){
-            HOMEKIT_CHARACTERISTIC(NAME, "Sonoff Outlet"),
+        HOMEKIT_SERVICE(SWITCH, .primary=true, .characteristics=(homekit_characteristic_t*[]){
+            HOMEKIT_CHARACTERISTIC(NAME, "Sonoff Switch"),
             &switch_on,
-            HOMEKIT_CHARACTERISTIC(OUTLET_IN_USE, true),
             NULL
         }),
         NULL
@@ -175,6 +216,7 @@ static bool initialized = false;
 homekit_server_config_t config = {
     .accessories = accessories,
     .password = ACCESSORY_SETUP_CODE,
+    .setupId = ACCESSORY_SETUP_ID,
     .on_event = on_homekit_event,
 };
 
@@ -216,6 +258,7 @@ bool wifi_is_configured() {
 
 void user_init(void) {
     uart_set_baud(0, 115200);
+    user_sysparam_init();
 
     relay_init();
     status = led_status_init(led_gpio, LED_ACTIVE_LEVEL);
